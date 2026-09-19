@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:csv/csv.dart';
@@ -44,7 +43,7 @@ class LWDProApp extends StatelessWidget {
 }
 
 // ============================================================
-//  DATA MODEL
+//  DATA MODELS
 // ============================================================
 class LWDReading {
   final double evd;
@@ -83,7 +82,7 @@ class TestPoint {
 }
 
 // ============================================================
-//  HOME
+//  HOME PAGE
 // ============================================================
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -91,8 +90,8 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
-  // BLE
+class _HomePageState extends State<HomePage> {
+  // BLE state
   BluetoothDevice? _device;
   BluetoothCharacteristic? _rx;
   StreamSubscription<List<int>>? _sub;
@@ -111,14 +110,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   final List<TestPoint> _tests = [];
   int _nextId = 1;
 
-  // Calibration
+  // Calibration / settings
   double _calFactor = 1.0;
   String _calDate = 'Never';
+  double _targetEvd = 40.0;
   final String _password = 'admin123';
   late SharedPreferences _prefs;
-
-  // Settings
-  double _targetEvd = 40.0;
 
   @override
   void initState() {
@@ -133,32 +130,47 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     super.dispose();
   }
 
+  // ============================================================
+  //  INIT & PERMISSIONS
+  // ============================================================
   Future<void> _init() async {
+    // Request permissions one by one
+    await Permission.location.request();
+    await Permission.bluetoothScan.request();
+    await Permission.bluetoothConnect.request();
+
+    final scan = await Permission.bluetoothScan.status;
+    final connect = await Permission.bluetoothConnect.status;
+    final loc = await Permission.location.status;
+
+    print("=== Permissions ===");
+    print("BluetoothScan: $scan");
+    print("BluetoothConnect: $connect");
+    print("Location: $loc");
+
+    if (!scan.isGranted || !connect.isGranted) {
+      if (mounted) setState(() => _status = "Permissions denied");
+      return;
+    }
+
     _prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       _calFactor = _prefs.getDouble('cal') ?? 1.0;
       _calDate = _prefs.getString('calDate') ?? 'Never';
       _targetEvd = _prefs.getDouble('target') ?? 40.0;
     });
-    await _requestPerms();
-  }
 
-  Future<void> _requestPerms() async {
-    final result = await [
-      Permission.location,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-    ].request();
-    if (mounted) {
-      final ok = result.values.every((s) => s.isGranted);
-      setState(() => _status = ok ? "Ready" : "Permissions denied");
-    }
+    await Future.delayed(const Duration(milliseconds: 800));
+    _startScan();
   }
 
   // ============================================================
   //  SCAN
   // ============================================================
   Future<void> _startScan() async {
+    if (_scanning) return;
+
     if (!await FlutterBluePlus.isOn) {
       if (mounted) {
         setState(() => _status = "Bluetooth OFF");
@@ -172,76 +184,111 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _status = "Scanning...";
     });
 
-    FlutterBluePlus.stopScan();
-    await Future.delayed(const Duration(milliseconds: 300));
+    try { await FlutterBluePlus.stopScan(); } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 500));
 
-    BluetoothDevice? found;
+    BluetoothDevice? foundDevice;
+
     final sub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
-        final n = r.device.platformName;
-        if (n.startsWith("LWD")) {
-          found = r.device;
+        final name = r.device.platformName;
+        final advName = r.advertisementData.advName;
+        if (name.contains("LWD") || advName.contains("LWD")) {
+          if (foundDevice == null) {
+            foundDevice = r.device;
+            print("=== FOUND TARGET: ${r.device.remoteId} ===");
+          }
         }
       }
     });
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
-    await Future.delayed(const Duration(seconds: 9));
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+    } catch (e) {
+      print("=== Scan error: $e ===");
+    }
+
+    await Future.delayed(const Duration(seconds: 11));
     await sub.cancel();
-    FlutterBluePlus.stopScan();
+    try { await FlutterBluePlus.stopScan(); } catch (_) {}
+
+    if (!mounted) return;
     setState(() => _scanning = false);
 
-    if (found != null) {
-      _connect(found!);
+    if (foundDevice != null) {
+      _connect(foundDevice!);
     } else {
       setState(() => _status = "Not found");
-      _snack("No LWD device found");
+      _snack("No LWD device found - tap scan again");
     }
   }
 
   // ============================================================
-  //  CONNECT
+  //  CONNECT (with retry)
   // ============================================================
   Future<void> _connect(BluetoothDevice device) async {
     setState(() => _status = "Connecting...");
-    try {
-      await device.connect(timeout: const Duration(seconds: 15));
-      await Future.delayed(const Duration(milliseconds: 500));
+    print("=== Connecting to ${device.remoteId} ===");
 
-      final services = await device.discoverServices();
-      BluetoothCharacteristic? target;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        print("=== Attempt $attempt ===");
+        await device.connect(timeout: const Duration(seconds: 15));
+        print("=== Connected ===");
 
-      for (final s in services) {
-        for (final c in s.characteristics) {
-          final u = c.uuid.toString().toLowerCase().replaceAll('-', '');
-          if (u == "6e400002b5a3f393e0a9e50e24dcca9e") target = c;
+        await Future.delayed(const Duration(milliseconds: 700));
+
+        final services = await device.discoverServices();
+        print("=== ${services.length} services found ===");
+
+        BluetoothCharacteristic? target;
+        for (final s in services) {
+          print("  Service: ${s.uuid}");
+          for (final c in s.characteristics) {
+            print("    Char: ${c.uuid}");
+            final u = c.uuid.toString().toLowerCase().replaceAll('-', '');
+            if (u == "6e400002b5a3f393e0a9e50e24dcca9e") {
+              target = c;
+              print("    ^^ TARGET MATCH ^^");
+            }
+          }
+        }
+
+        if (target == null) throw Exception("Characteristic not found");
+
+        _device = device;
+        _rx = target;
+
+        await target.setNotifyValue(true);
+        print("=== Notifications enabled ===");
+
+        _sub = target.onValueReceived.listen((v) {
+          final t = utf8.decode(v, allowMalformed: true);
+          print("=== RX: $t ===");
+          _onData(t);
+        });
+
+        setState(() {
+          _connected = true;
+          _status = "Online";
+        });
+        print("=== ONLINE ===");
+        return;
+      } catch (e) {
+        print("=== Attempt $attempt failed: $e ===");
+        if (attempt < 3) {
+          try { await device.disconnect(); } catch (_) {}
+          await Future.delayed(const Duration(seconds: 2));
         }
       }
-
-      if (target == null) throw Exception("Characteristic not found");
-
-      _device = device;
-      _rx = target;
-      await target.setNotifyValue(true);
-
-      _sub = target.onValueReceived.listen((v) {
-        final t = utf8.decode(v, allowMalformed: true);
-        _onData(t);
-      });
-
-      setState(() {
-        _connected = true;
-        _status = "Online";
-      });
-      _snack("Connected to LWD-PROBE");
-    } catch (e) {
-      setState(() {
-        _connected = false;
-        _status = "Failed";
-      });
-      _snack("Connection failed: $e");
-      try { await device.disconnect(); } catch (_) {}
     }
+
+    if (!mounted) return;
+    setState(() {
+      _connected = false;
+      _status = "Failed";
+    });
+    _snack("Connection failed - try again");
   }
 
   Future<void> _disconnect() async {
@@ -258,13 +305,13 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   // ============================================================
-  //  DATA
+  //  DATA PARSING
   // ============================================================
   void _onData(String raw) {
     try {
-      final trimmed = raw.trim();
-      if (!trimmed.startsWith("{")) return;
-      final m = jsonDecode(trimmed) as Map<String, dynamic>;
+      final t = raw.trim();
+      if (!t.startsWith("{")) return;
+      final m = jsonDecode(t) as Map<String, dynamic>;
 
       final evd = (m["evd"] ?? 0).toDouble() * _calFactor;
       final def = (m["def"] ?? 0).toDouble();
@@ -272,6 +319,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       final vel = (m["vel"] ?? 0).toDouble();
       final ang = (m["angle"] ?? 0).toDouble();
 
+      if (!mounted) return;
       setState(() {
         _live = LWDReading(
           evd: evd, deflection: def, accel: acc, velocity: vel, angle: ang,
@@ -283,22 +331,15 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         }
       });
 
-      // Auto-record significant impacts
-      if (def > 0.1 && evd > 0.5) {
-        _recordTest(evd, def);
-      }
-    } catch (e) {
-      // Silent - just skip bad frames
-    }
+      if (def > 0.1 && evd > 0.5) _recordTest(evd, def);
+    } catch (_) {}
   }
 
   Future<void> _recordTest(double evd, double def) async {
-    // Avoid duplicates (debounce)
     if (_tests.isNotEmpty &&
         DateTime.now().difference(_tests.last.time).inSeconds < 2) {
       return;
     }
-
     double lat = 0, lng = 0;
     try {
       final pos = await Geolocator.getCurrentPosition(
@@ -309,7 +350,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       lng = pos.longitude;
     } catch (_) {}
 
-    final point = TestPoint(
+    final p = TestPoint(
       id: _nextId++,
       time: DateTime.now(),
       evd: evd,
@@ -319,7 +360,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       passed: evd >= _targetEvd,
     );
     if (!mounted) return;
-    setState(() => _tests.add(point));
+    setState(() => _tests.add(p));
   }
 
   // ============================================================
@@ -360,6 +401,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   void _showCalEditor() {
     final factor = TextEditingController(text: _calFactor.toStringAsFixed(3));
+    final target = TextEditingController(text: _targetEvd.toStringAsFixed(1));
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -371,7 +413,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
             TextField(
               controller: factor,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Multiplier'),
+              decoration: const InputDecoration(labelText: 'EVD Multiplier'),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: target,
+              keyboardType: TextInputType.number,
+              decoration:
+                  const InputDecoration(labelText: 'Target EVD (MN/m²)'),
             ),
             const SizedBox(height: 12),
             Text('Last update: $_calDate',
@@ -385,17 +434,21 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           ),
           TextButton(
             onPressed: () async {
-              final v = double.tryParse(factor.text);
-              if (v != null && v > 0) {
-                await _prefs.setDouble('cal', v);
+              final f = double.tryParse(factor.text);
+              final t = double.tryParse(target.text);
+              if (f != null && f > 0 && t != null && t > 0) {
+                await _prefs.setDouble('cal', f);
+                await _prefs.setDouble('target', t);
                 await _prefs.setString(
                     'calDate',
                     DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now()));
+                if (!mounted) return;
                 setState(() {
-                  _calFactor = v;
+                  _calFactor = f;
+                  _targetEvd = t;
                   _calDate = _prefs.getString('calDate')!;
                 });
-                if (mounted) Navigator.pop(ctx);
+                Navigator.pop(ctx);
               }
             },
             child: const Text('Save'),
@@ -406,7 +459,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   // ============================================================
-  //  EXPORT
+  //  EXPORT CSV
   // ============================================================
   Future<void> _export() async {
     if (_tests.isEmpty) {
@@ -460,12 +513,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     final passed = _live.evd >= _targetEvd;
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0A0E1A),
         title: Row(
-          children: [
-            const Icon(Icons.science, color: Color(0xFF00E5FF)),
-            const SizedBox(width: 8),
-            const Text('LWD PRO',
+          children: const [
+            Icon(Icons.science, color: Color(0xFF00E5FF)),
+            SizedBox(width: 8),
+            Text('LWD PRO',
                 style: TextStyle(
                     fontWeight: FontWeight.bold, letterSpacing: 1.2)),
           ],
@@ -486,8 +538,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(_status,
-                style:
-                    const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                style: const TextStyle(
+                    fontSize: 10, fontWeight: FontWeight.bold)),
           ),
           IconButton(
             icon: _scanning
@@ -496,7 +548,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     height: 20,
                     child: CircularProgressIndicator(strokeWidth: 2))
                 : const Icon(Icons.bluetooth_searching),
-            onPressed: _connected || _scanning ? null : _startScan,
+            onPressed: (_connected || _scanning) ? null : _startScan,
           ),
           IconButton(
             icon: const Icon(Icons.power_settings_new),
@@ -563,9 +615,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                 padding:
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 decoration: BoxDecoration(
-                  color: passed
-                      ? Colors.green.shade800
-                      : Colors.red.shade800,
+                  color:
+                      passed ? Colors.green.shade800 : Colors.red.shade800,
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Row(
@@ -578,7 +629,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     const SizedBox(width: 6),
                     Text(passed ? 'PASS' : 'FAIL',
                         style: const TextStyle(
-                            fontWeight: FontWeight.bold, color: Colors.white)),
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white)),
                   ],
                 ),
               ),
@@ -604,7 +656,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                         Text('0',
                             style: TextStyle(
                                 fontSize: 9, color: Colors.grey.shade500)),
-                        Text('Target ${_targetEvd.toStringAsFixed(0)}',
+                        Text(
+                            'Target ${_targetEvd.toStringAsFixed(0)}',
                             style: TextStyle(
                                 fontSize: 9, color: Colors.grey.shade500)),
                         Text('80',
@@ -621,10 +674,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              _smallInfo(Icons.speed, '${_live.velocity.toStringAsFixed(3)} m/s'),
-              _smallInfo(Icons.straighten, '${_live.angle.toStringAsFixed(1)}°'),
-              _smallInfo(Icons.timer,
-                  DateFormat('HH:mm:ss').format(_live.time)),
+              _smallInfo(
+                  Icons.speed, '${_live.velocity.toStringAsFixed(3)} m/s'),
+              _smallInfo(
+                  Icons.straighten, '${_live.angle.toStringAsFixed(1)}°'),
+              _smallInfo(
+                  Icons.timer, DateFormat('HH:mm:ss').format(_live.time)),
             ],
           ),
         ],
@@ -639,7 +694,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       children: [
         Text(label,
             style: TextStyle(
-                color: Colors.grey.shade500, fontSize: 10, letterSpacing: 1)),
+                color: Colors.grey.shade500,
+                fontSize: 10,
+                letterSpacing: 1)),
         const SizedBox(height: 4),
         Row(
           crossAxisAlignment: CrossAxisAlignment.baseline,
@@ -647,7 +704,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           children: [
             Text(value,
                 style: TextStyle(
-                    fontSize: size, fontWeight: FontWeight.bold, color: color)),
+                    fontSize: size,
+                    fontWeight: FontWeight.bold,
+                    color: color)),
             const SizedBox(width: 4),
             Text(unit,
                 style:
@@ -664,7 +723,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         Icon(icon, size: 14, color: Colors.grey.shade500),
         const SizedBox(width: 4),
         Text(text,
-            style: TextStyle(color: Colors.grey.shade400, fontSize: 11)),
+            style:
+                TextStyle(color: Colors.grey.shade400, fontSize: 11)),
       ],
     );
   }
@@ -737,8 +797,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Widget _buildStatsCard() {
-    final passed =
-        _tests.where((t) => t.passed).length;
+    final passed = _tests.where((t) => t.passed).length;
     final failed = _tests.length - passed;
     final avg = _tests.isEmpty
         ? 0.0
@@ -764,7 +823,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               _stat('TOTAL', '${_tests.length}', Colors.white),
               _stat('PASS', '$passed', Colors.green),
               _stat('FAIL', '$failed', Colors.red),
-              _stat('AVG', avg.toStringAsFixed(1), const Color(0xFF00E5FF)),
+              _stat('AVG', avg.toStringAsFixed(1),
+                  const Color(0xFF00E5FF)),
             ],
           ),
         ],
